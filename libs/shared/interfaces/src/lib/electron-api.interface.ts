@@ -1,3 +1,8 @@
+import type {
+    CatchupDownloadMetadata,
+    DownloadRecoveryResult,
+    DownloadContentType,
+} from './catchup-download.interface';
 import {
     EmbeddedMpvBounds,
     EmbeddedMpvRecordingStartOptions,
@@ -585,7 +590,8 @@ export interface ElectronBridgeDownloadHeaders {
 export interface ElectronBridgeDownloadStartPayload {
     playlistId: string;
     xtreamId: number;
-    contentType: ElectronBridgePlaybackContentType;
+    contentType: DownloadContentType;
+    catchup?: CatchupDownloadMetadata | null;
     title: string;
     url: string;
     posterUrl?: string;
@@ -616,7 +622,8 @@ export interface ElectronDownloadItem {
     id: number;
     playlistId: string;
     xtreamId: number;
-    contentType: ElectronBridgePlaybackContentType;
+    contentType: DownloadContentType;
+    catchup?: CatchupDownloadMetadata | null;
     seriesXtreamId?: number;
     seasonNumber?: number;
     episodeNumber?: number;
@@ -1290,7 +1297,7 @@ export interface ElectronBridgeApi {
     downloadsRedownloadMissing: (
         downloadId: number
     ) => Promise<ElectronBridgeDownloadRedownloadResult>;
-    downloadsRemove: (downloadId: number) => Promise<ElectronBridgeErrorResult>;
+    downloadsRemove: (downloadId: number) => Promise<DownloadRecoveryResult>;
     downloadsGetList: (playlistId?: string) => Promise<ElectronDownloadItem[]>;
     downloadsGet: (downloadId: number) => Promise<ElectronDownloadItem | null>;
     downloadsUpdateMetadata: (
@@ -1305,7 +1312,7 @@ export interface ElectronBridgeApi {
     downloadsPlayFile: (filePath: string) => Promise<ElectronBridgeErrorResult>;
     downloadsClearCompleted: (
         playlistId?: string
-    ) => Promise<ElectronBridgeResult>;
+    ) => Promise<DownloadRecoveryResult>;
     onDownloadsUpdate: (callback: () => void) => () => void;
     // Live-TV recordings surface. Optional: older Electron builds have no
     // recordings bridge, and `supportsRecordings` (not `supportsDownloads`)

@@ -1,19 +1,24 @@
+import { cleanupArchiveCapture } from './download-catchup-capture';
+import { reserveTarget } from './download-runtime-reservation';
+import {
+    clearArchiveFinalization,
+    readArchiveFinalizations,
+} from './download-catchup-journal';
+import { cleanupStoredCatchupPartial } from './download-catchup-removal';
+import {
+    persistCancellation,
+    persistPause,
+    persistQueuedCancellation,
+} from './download-runtime-persistence';
+import { transferCatchupToPartialFile } from './download-catchup-transfer';
 import { eq, sql } from 'drizzle-orm';
-import { existsSync } from 'node:fs';
-import { rename } from 'node:fs/promises';
 import { getDatabase } from '../../database/connection';
 import * as schema from '../../database/schema';
 import { broadcastDownloadUpdate } from './download-broadcast';
-import {
-    findAvailableFinalPath,
-    getPartialDownloadPath,
-    reserveAvailablePartialDownloadFile,
-    type ReservedPartialDownloadFile,
-} from './download-file-path';
+import type { ReservedPartialDownloadFile } from './download-file-path';
 import {
     completeDownloadFromPartial,
     getCompletedPartialProgress,
-    getPausedByteCount,
     handleDownloadFailure,
     removePartialFile,
 } from './download-finalize';
@@ -21,7 +26,6 @@ import { transferWithReconnects } from './download-reconnect';
 import {
     requestDownloadCancellation,
     requestDownloadPause,
-    type DownloadsDatabase,
     type DownloadTask,
 } from './download-task';
 import { describeError } from './download-transfer';
@@ -30,6 +34,7 @@ export { broadcastDownloadUpdate, setMainWindow } from './download-broadcast';
 
 const downloadQueue: DownloadTask[] = [];
 let activeDownload: DownloadTask | null = null;
+const settlementWaiters = new Map<number, Array<() => void>>();
 
 export function enqueueDownload(task: DownloadTask): void {
     // A duplicate id (e.g. two rapid Resume clicks racing the status
@@ -48,8 +53,7 @@ export function enqueueDownload(task: DownloadTask): void {
 
 export async function pauseDownload(downloadId: number): Promise<boolean> {
     if (activeDownload?.id === downloadId) {
-        requestDownloadPause(activeDownload);
-        return true;
+        return requestDownloadPause(activeDownload);
     }
 
     const queueIndex = downloadQueue.findIndex(
@@ -75,8 +79,7 @@ export async function pauseDownload(downloadId: number): Promise<boolean> {
 
 export async function cancelDownload(downloadId: number): Promise<boolean> {
     if (activeDownload?.id === downloadId) {
-        requestDownloadCancellation(activeDownload);
-        return true;
+        return requestDownloadCancellation(activeDownload);
     }
 
     const queueIndex = downloadQueue.findIndex(
@@ -84,8 +87,15 @@ export async function cancelDownload(downloadId: number): Promise<boolean> {
     );
     if (queueIndex !== -1) {
         const [queuedTask] = downloadQueue.splice(queueIndex, 1);
-        const removed = removePartialFile(queuedTask?.filePath);
         const db = await getDatabase();
+        const removed = queuedTask?.catchup
+            ? await cleanupStoredCatchupPartial(
+                  db,
+                  downloadId,
+                  queuedTask.filePath,
+                  true
+              )
+            : removePartialFile(queuedTask?.filePath);
         await persistQueuedCancellation(
             db,
             downloadId,
@@ -99,6 +109,7 @@ export async function cancelDownload(downloadId: number): Promise<boolean> {
     const rows = await db
         .select({
             filePath: schema.downloads.filePath,
+            contentType: schema.downloads.contentType,
             status: schema.downloads.status,
         })
         .from(schema.downloads)
@@ -109,7 +120,15 @@ export async function cancelDownload(downloadId: number): Promise<boolean> {
         return false;
     }
 
-    const removed = removePartialFile(item.filePath);
+    const removed =
+        item.contentType === 'catchup'
+            ? await cleanupStoredCatchupPartial(
+                  db,
+                  downloadId,
+                  item.filePath,
+                  true
+              )
+            : removePartialFile(item.filePath);
     await persistQueuedCancellation(
         db,
         downloadId,
@@ -119,9 +138,42 @@ export async function cancelDownload(downloadId: number): Promise<boolean> {
     return true;
 }
 
-export function removeDownloadFromRuntime(downloadId: number): void {
+/** Keep the journal row until an accepted active cancellation has settled. */
+export async function prepareArchiveRemoval(
+    downloadId: number
+): Promise<boolean> {
+    if (activeDownload?.id === downloadId && activeDownload.catchup) {
+        if (!requestDownloadCancellation(activeDownload)) return false;
+        await new Promise<void>((resolve) => {
+            const waiters = settlementWaiters.get(downloadId) ?? [];
+            waiters.push(resolve);
+            settlementWaiters.set(downloadId, waiters);
+        });
+    } else if (
+        downloadQueue.some((task) => task.id === downloadId && task.catchup)
+    ) {
+        await cancelDownload(downloadId);
+    }
+    return true;
+}
+
+export function hasRuntimeDownload(downloadId: number): boolean {
+    return (
+        activeDownload?.id === downloadId ||
+        downloadQueue.some((task) => task.id === downloadId)
+    );
+}
+
+export function isDownloadCommitting(downloadId: number): boolean {
+    return (
+        activeDownload?.id === downloadId &&
+        !!activeDownload.catchupCommitStarted
+    );
+}
+
+export function removeDownloadFromRuntime(downloadId: number): boolean {
     if (activeDownload?.id === downloadId) {
-        requestDownloadCancellation(activeDownload);
+        if (!requestDownloadCancellation(activeDownload)) return false;
     }
 
     const queueIndex = downloadQueue.findIndex(
@@ -130,6 +182,7 @@ export function removeDownloadFromRuntime(downloadId: number): void {
     if (queueIndex !== -1) {
         downloadQueue.splice(queueIndex, 1);
     }
+    return true;
 }
 
 async function processQueue(): Promise<void> {
@@ -158,29 +211,10 @@ function finishTask(task: DownloadTask): void {
     if (activeDownload === task) {
         activeDownload = null;
     }
+    for (const resolve of settlementWaiters.get(task.id) ?? []) resolve();
+    settlementWaiters.delete(task.id);
     broadcastDownloadUpdate();
     void processQueue();
-}
-
-async function persistQueuedCancellation(
-    db: DownloadsDatabase,
-    downloadId: number,
-    // Keep the path when the retained .part could not be deleted, so a later
-    // remove/clear can retry the cleanup instead of orphaning the file.
-    retainedFilePath: string | null = null
-): Promise<void> {
-    await db
-        .update(schema.downloads)
-        .set({
-            bytesDownloaded: 0,
-            errorMessage: null,
-            filePath: retainedFilePath,
-            resumeValidator: null,
-            status: 'canceled',
-            totalBytes: null,
-            updatedAt: sql`CURRENT_TIMESTAMP`,
-        })
-        .where(eq(schema.downloads.id, downloadId));
 }
 
 async function startDownload(task: DownloadTask): Promise<void> {
@@ -206,7 +240,23 @@ async function startDownload(task: DownloadTask): Promise<void> {
             return;
         }
 
-        reservation = await reserveTarget(task);
+        if (task.catchup) {
+            if (task.filePath) {
+                const proof = (
+                    await readArchiveFinalizations(db, [task.id])
+                ).get(task.id);
+                cleanupArchiveCapture(proof);
+                task.catchupExpectedPartialIdentity = proof?.partialIdentity;
+                // No durable ownership evidence: preserve the old entry and
+                // reserve a fresh destination instead of adopting it.
+                if (!proof) task.filePath = null;
+            }
+            if (!task.filePath) {
+                // A fresh reservation must not inherit a previous attempt's proof.
+                await clearArchiveFinalization(db, task.id);
+            }
+        }
+        reservation = await reserveTarget(db, task);
         task.fileName = reservation.filename;
         task.filePath = reservation.path;
         await db
@@ -239,7 +289,9 @@ async function startDownload(task: DownloadTask): Promise<void> {
             return;
         }
 
-        const progress = await transferWithReconnects(db, task, reservation);
+        const progress = await (task.catchup
+            ? transferCatchupToPartialFile(db, task, reservation)
+            : transferWithReconnects(db, task, reservation));
         if (task.cancelRequested) {
             await persistCancellation(db, task);
             return;
@@ -264,89 +316,5 @@ async function startDownload(task: DownloadTask): Promise<void> {
     } finally {
         task.abortController = undefined;
         finishTask(task);
-    }
-}
-
-async function reserveTarget(
-    task: DownloadTask
-): Promise<ReservedPartialDownloadFile> {
-    if (task.filePath) {
-        if (!existsSync(task.filePath)) {
-            return {
-                filename: task.fileName,
-                partialPath: getPartialDownloadPath(task.filePath),
-                path: task.filePath,
-            };
-        }
-
-        // Something now occupies the recorded destination — possibly a file
-        // the user created while this download was paused or failed. Never
-        // inspect or delete it: move the retained .part to the next free
-        // numbered destination and finalize there instead.
-        const redirected = findAvailableFinalPath(task.filePath);
-        const currentPartial = getPartialDownloadPath(task.filePath);
-        const redirectedPartial = getPartialDownloadPath(redirected.path);
-        if (existsSync(currentPartial)) {
-            await rename(currentPartial, redirectedPartial);
-        }
-
-        return {
-            filename: redirected.filename,
-            partialPath: redirectedPartial,
-            path: redirected.path,
-        };
-    }
-
-    return reserveAvailablePartialDownloadFile(task.directory, task.fileName);
-}
-
-async function persistCancellation(
-    db: DownloadsDatabase,
-    task: DownloadTask
-): Promise<void> {
-    console.log(`[Downloads] Canceled: ${task.fileName}`);
-    const removed = removePartialFile(task.filePath);
-    try {
-        await db
-            .update(schema.downloads)
-            .set({
-                bytesDownloaded: 0,
-                errorMessage: null,
-                filePath: removed ? null : (task.filePath ?? null),
-                resumeValidator: null,
-                status: 'canceled',
-                totalBytes: null,
-                updatedAt: sql`CURRENT_TIMESTAMP`,
-            })
-            .where(eq(schema.downloads.id, task.id));
-    } catch (error) {
-        console.error('[Downloads] Failed to persist cancellation:', error);
-    }
-}
-
-async function persistPause(
-    db: DownloadsDatabase,
-    task: DownloadTask
-): Promise<void> {
-    console.log(`[Downloads] Paused: ${task.fileName}`);
-    const bytesDownloaded = getPausedByteCount(task);
-    try {
-        await db
-            .update(schema.downloads)
-            .set({
-                bytesDownloaded,
-                errorMessage: null,
-                fileName: task.fileName,
-                filePath: task.filePath ?? null,
-                // Keep a mid-attempt validator promotion (complete overlap
-                // match) across pause/resume.
-                resumeValidator: task.resumeValidator ?? null,
-                status: 'paused',
-                totalBytes: task.totalBytes ?? null,
-                updatedAt: sql`CURRENT_TIMESTAMP`,
-            })
-            .where(eq(schema.downloads.id, task.id));
-    } catch (error) {
-        console.error('[Downloads] Failed to persist pause:', error);
     }
 }

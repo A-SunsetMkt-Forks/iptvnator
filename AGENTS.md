@@ -1045,3 +1045,37 @@ Xtream/M3U archives, including Favorites/Recent. `EpgArchiveCopyService` owns
 clipboard feedback; hosts resolve URLs without mutating playback. Stalker and
 the currently non-catch-up M3U guide expose no action. See
 `docs/architecture/m3u-playlist-module.md` (Copy archive URL).
+
+## Xtream Archive Downloads
+
+Desktop Xtream Live TV programme details can enqueue completed catch-up as
+`contentType: catchup`. The queue uses the existing timeshift resolver, original
+timestamps and playback headers. `programme_start` plus playlist/channel provides
+identity; JSON `catchup` metadata retains channel, broadcast window and known
+expiry. `download-schema.ts` owns the transactional CHECK/index migration;
+`download-tables.ts` exports the download tables. The cascading
+`download_archive_finalizations` table records write-ahead file identity/size
+proof before promotion (before writing a fallback copy), allowing startup to
+recover completed unknown-length archives and clean only their owned partials.
+The same journal stores transfer-phase descriptor identity before truncation;
+Resume checks it at open, and rejected replacements are preserved and detached
+so Retry can reserve a fresh path. A synchronous completion-commit boundary
+rejects late pause/cancel commands before awaited cleanup and persistence.
+Archive ownership reads device/inode as BigInt and journals decimal strings
+without losing 64-bit Windows file references, alongside positive creation time to reject
+reused inodes after unlink; old proofs without creation time remain untrusted.
+Fresh reservations atomically commit their row path/name and captured ownership
+before the initial HTTP wait;
+no preexisting partial is truncated without matching expected ownership.
+Captured foreign files retain their recovery copy and journal even after public
+restoration, until the user explicitly removes the recovery copy. Remove/Clear
+show its full path and recovery instructions in a persistent dialog with Copy
+recovery path.
+Private cleanup captures are journaled before relocation, keeping failed
+Remove/Clear/cancel cleanup retryable across restarts without hardlinks. Active
+failures, promotion and startup share that cleanup; Remove waits for active
+archive cancellation to settle before deleting its row and journal.
+Archive transfers validate TS framing, restart from byte zero after interruption
+and check expiry again at transfer start. Completed cards play locally and never
+route to VOD details. Contract and EOF/duration limits:
+`docs/architecture/download-manager.md` (Xtream archive downloads).

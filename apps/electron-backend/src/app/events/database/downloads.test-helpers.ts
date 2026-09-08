@@ -11,6 +11,13 @@ type IpcHandler = (_event: unknown, ...args: unknown[]) => Promise<unknown>;
 export const mockRegisteredHandlers = new Map<string, IpcHandler>();
 export const mockGetDatabase = jest.fn();
 export const mockRemoveDownloadFromRuntime = jest.fn();
+export const mockIsDownloadCommitting = jest.fn();
+export const mockHasRuntimeDownload = jest.fn();
+export const mockPrepareArchiveRemoval = jest.fn();
+export const mockArchiveProofs = jest.fn();
+export const mockVerifiedArchiveSize = jest.fn();
+export const mockRecordArchiveCleanupPath = jest.fn();
+export const mockRemoveJournaledPartial = jest.fn();
 export const mockBroadcastDownloadUpdate = jest.fn();
 export const mockRemovePartialDownloadFile = jest.fn();
 export const mockPauseDownload = jest.fn();
@@ -53,6 +60,13 @@ export async function setupDownloadsEventsHarness(): Promise<void> {
     mockRegisteredHandlers.clear();
     mockGetDatabase.mockReset();
     mockRemoveDownloadFromRuntime.mockReset();
+    mockIsDownloadCommitting.mockReset().mockReturnValue(false);
+    mockHasRuntimeDownload.mockReset().mockReturnValue(false);
+    mockPrepareArchiveRemoval.mockReset().mockResolvedValue(true);
+    mockVerifiedArchiveSize.mockReset().mockReturnValue(null);
+    mockArchiveProofs.mockReset().mockResolvedValue(new Map());
+    mockRecordArchiveCleanupPath.mockReset();
+    mockRemoveJournaledPartial.mockReset();
     mockBroadcastDownloadUpdate.mockReset();
     mockRemovePartialDownloadFile.mockReset();
     mockPauseDownload.mockReset();
@@ -111,9 +125,20 @@ export async function setupDownloadsEventsHarness(): Promise<void> {
     jest.doMock('./download-redownload', () => ({
         redownloadMissingRequest: mockRedownloadMissingRequest,
     }));
+    jest.doMock('./download-catchup-journal', () => ({
+        readArchiveFinalizations: mockArchiveProofs,
+        verifiedArchiveSize: mockVerifiedArchiveSize,
+        recordArchiveCleanupPath: mockRecordArchiveCleanupPath,
+    }));
+    jest.doMock('./download-catchup-removal', () => ({
+        removeJournaledCatchupPartial: mockRemoveJournaledPartial,
+    }));
     jest.doMock('./download-runtime', () => ({
         broadcastDownloadUpdate: mockBroadcastDownloadUpdate,
         cancelDownload: jest.fn(),
+        isDownloadCommitting: mockIsDownloadCommitting,
+        hasRuntimeDownload: mockHasRuntimeDownload,
+        prepareArchiveRemoval: mockPrepareArchiveRemoval,
         pauseDownload: mockPauseDownload,
         removeDownloadFromRuntime: mockRemoveDownloadFromRuntime,
         setMainWindow: jest.fn(),
@@ -168,6 +193,7 @@ export function expectManagedPathLookup(
 }
 
 export function mockDownloadRow(row: {
+    contentType?: string;
     filePath: string | null;
     status: string;
 }) {
@@ -187,7 +213,11 @@ export function mockDownloadRow(row: {
 }
 
 export function mockTerminalRows(
-    rows: Array<{ filePath: string | null; status: string }>
+    rows: Array<{
+        filePath: string | null;
+        status: string;
+        contentType?: string;
+    }>
 ) {
     const deleteWhere = jest.fn().mockResolvedValue(undefined);
     const selectWhere = jest

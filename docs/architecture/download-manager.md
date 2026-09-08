@@ -7,10 +7,173 @@ views. Backend work is handled in the Electron process while the Angular
 renderer exposes the global `/workspace/downloads` page, source-scoped route
 variants, contextual buttons, and theme-aware styling.
 
+## Xtream archive downloads
+
+The desktop Xtream Live TV programme dialog offers **Download programme (TS)**
+for completed, available catch-up programmes in both timeline and list views.
+The host captures the playlist, channel and original programme timestamps before
+resolving the existing timeshift URL (including the panel timezone). A channel
+change while the dialog is open invalidates its action. Downloading does not
+select the programme or change playback. Collection views retain archive URL
+copying; archive downloads are initially exposed through Xtream Live TV only.
+M3U, Stalker and PWA archive downloads, HLS assembly and recording future broadcasts
+are outside this feature.
+
+`EpgArchiveDownloadService` submits the resolved URL and the playlist's playback
+header allowlist to the existing desktop queue. Pending submission suppression
+is per programme identity, so slow resolution does not discard a different
+programme's request. HLS URLs are refused explicitly;
+the backend also checks the response type and every 188-byte MPEG-TS packet.
+No transcoder or media helper is required. The file always uses `.ts`.
+
+The `catchup` download type stores `programme_start` and JSON metadata containing
+channel name, start/stop Unix seconds and the known archive expiry. Its unique
+identity is `(playlist_id, xtream_id, programme_start)`; movies and episodes keep
+their existing identity. `download-schema.ts` widens the SQLite CHECK in a
+transaction after older additive migrations, preserving row IDs, files, headers,
+resume state and metadata. It also replaces the former global unique index with
+separate catch-up and non-catch-up indexes.
+
+Only ended programmes can be enqueued. Known expiry is checked on enqueue,
+retry, resume, missing-file recovery and when the queued transfer starts.
+Pause keeps its owned partial file, but **resume/retry restarts from byte zero**,
+without Range, If-Range, or automatic reconnect append. The queue explains this.
+Before truncating, `download-catchup-output.ts` rejects symlinks and hardlinks,
+opens without truncation (with O_NOFOLLOW where available), checks descriptor
+identity against lstat, then truncates and writes through that same descriptor.
+An absent partial is created exclusively, so a replaced path cannot redirect writes.
+The task retains that descriptor's device/inode identity through promotion:
+`download-catchup-finalize.ts` verifies the source and published file, rejects a
+replaced partial, and copies from the verified descriptor on filesystems without
+hardlinks. Existing destination files are never overwritten. Cleanup atomically
+moves the public pathname into a private temporary directory before checking its
+identity and removing it. A captured replacement is restored with no-clobber
+linking; if restoration is unavailable or the original pathname is occupied,
+the file is retained in `.iptvnator-cleanup-*/entry` and its recovery location
+is logged. Cleanup never recursively deletes a nonempty quarantine. This closes
+the predictable-path check/unlink window; it does not isolate files from
+same-user processes that deliberately enter the private temporary directory.
+Active failure and cancellation use the same captured transfer identity; a
+partial that was never safely opened is preserved instead of being deleted.
+`download_archive_finalizations` is a write-ahead SQLite journal keyed by download
+ID (cascade-deleted with the download). It records the path, size, source identity
+and expected final identity **before hardlink promotion**, or before the first
+byte is written to an exclusively created copy destination. Thus even a completed
+unknown-length file has durable proof before the completion-status write. Startup
+requires that proof and a matching regular file, identity and size to recover an
+archive; termination before promotion leaves the verified partial paused. An
+owned incomplete copy is removed by journal identity before the source resumes. The
+journal also makes startup partial cleanup identity-aware. A journaled partial
+whose identity changed is preserved and detached from the failed row; Retry
+reserves a fresh path instead of adopting or truncating it. The journal remains with
+completed archives until they are removed. An explicitly restarted transfer
+carries the journaled source identity to output opening and checks
+it against the opened descriptor. Only then does it replace the previous proof,
+before truncation or writes, replacing the old finalization proof with a
+transfer-phase journal containing the newly opened identity. That identity
+survives pause, failure and restart without claiming the file is complete. A
+rejected replacement is detached from the failed row without deletion, so Retry
+reserves a new path. Retained catch-up paths without any durable proof are also
+preserved and redirected to a fresh reservation. On a final-path collision,
+archives never relocate a retained partial: only a verified owned partial is
+discarded before reserving a new filename, because archive retries restart at zero. The transfer proof is upgraded to finalization proof only
+after validated EOF. Process-local proof allows immediate
+recovery after a transient completion DB error without waiting for a restart.
+Fallback copying observes pause/cancel between bounded 64 KiB reads/writes and
+before publication completes. Interruption removes only the owned copy and
+leaves the source for the runtime pause/cancel handler. Once publication identity
+and size pass the final check, the task synchronously enters completion commit
+before awaited partial cleanup and the SQLite completion write. Pause/cancel then
+return false without setting flags; a command is never accepted and subsequently
+overwritten by completion. Remove rejects this committing row before partial
+cleanup or deletion, and Clear completed skips it, preserving the cascading
+journal until completion finishes. Remove waits for an accepted active archive
+cancellation to settle before reading/deleting its row; queued archives are
+canceled first, and a concurrent new runtime attempt blocks removal. A settled
+archive still marked downloading after a failed status write also retries
+journal cleanup before row deletion. Remove/Clear preserve a final file whose
+journaled device/inode/creation-time identity and full size prove completed promotion, even when completion
+status writes failed and its stored status is stale. Repeat submissions, Retry
+and Resume restore such a journal-proven completion in place before any new
+transfer or ownership reset, before expiry, provider DNS and new-folder checks
+that apply only to another remote transfer; retained cleanup failures keep their
+journal. Remove, Clear completed and missing-file
+re-download and repeated programme submissions use journal-backed private
+capture for archive partial cleanup;
+unknown or replaced entries are preserved. Ownership reads device/inode as BigInt and journals decimal strings without
+losing 64-bit Windows file references, alongside a positive file creation timestamp, so inode reuse after unlink cannot
+bless a new entry; proofs lacking creation time remain untrusted. Fresh
+reservations capture this identity from their exclusive creation descriptor and
+commit it together with the downloads row path/name in one SQLite transaction
+before the HTTP wait. A committed reservation is therefore recoverable even if
+the process exits before transfer setup. Existing partials without matching expected
+ownership are never truncated, including before the first response. Before capture, a synchronous SQLite
+write records `partialCleanupPath` (or `finalCleanupPath` for failed promotion)
+in the existing ownership proof. Active cancellation/failure, promotion and
+startup recovery use the same journal-backed cleanup as manual actions. Cancel,
+failure and removal of an unfinished attempt also clean its journaled final target;
+removing a completed row preserves its media. Retry cleans an incomplete owned
+final before reserving a destination. A failed
+unlink or replacement restoration keeps that durable pointer and blocks journal
+deletion/replacement. Later cleanup retries no-clobber restoration of captured
+foreign entries; an occupied public path or unsupported hardlinks preserves both
+the capture and its journal for recovery. Even after a foreign entry is restored,
+its private recovery copy is never automatically unlinked: another process could
+remove the public link first. Remove/Clear return a structured recovery path and open a persistent, localized
+dialog with the full path, Copy recovery path and manual recovery instructions.
+Copy keeps the dialog open, including on clipboard failure; Close dismisses it.
+After the user recovers it and explicitly removes that private copy, cleanup may release the
+journal. Ordinary owned-file cleanup remains automatic. Remove/Clear, Retry/Resume and fresh
+reservations retry identity-verified cleanup, including after restart and on
+filesystems without hardlinks. Cleanup remains synchronous after the
+runtime guard, so a completion transition cannot interleave with unlink.
+Missing archive re-downloads claim a fresh reservation instead of inheriting the
+completed file's identity.
+If the initial reservation journal write fails, persistence is retried once
+before journal-backed cleanup. If SQLite remains unavailable, the empty
+reservation stays at its public path; no unjournaled entry is relocated. An
+empty fallback-copy target whose final proof cannot commit is likewise preserved.
+A kill between exclusive reservation/copy-file creation and its identity journal
+commit, or persistent SQLite failure before that commit, can leave an unowned
+**empty** destination: no bytes are written before the commit.
+Recovery preserves that file rather than guessing ownership; Retry uses a
+numbered free destination. SQLite and filesystem creation cannot commit
+atomically, and portable rename cannot guarantee no-clobber publication on the
+filesystems that need this fallback. This bounded orphan is preferred to deleting
+or overwriting an unrelated file.
+Cancellation of queued/paused archives uses the same journal-backed cleanup as
+Remove; unproven or replaced entries, including symlinks, are preserved.
+A retained archive cannot use the VOD byte-count completion shortcut. Transfers
+have a 30-second idle timeout and a total deadline of twice programme duration
+plus ten minutes, capped at 24 hours. Transfers also stop at the smallest of a
+100 Mbit/s budget for the programme duration plus one minute, 64 GiB, and
+half of the initial available space after subtracting a 1 GiB reserve (reserving a second
+copy for filesystems without hardlinks). The retained partial is safely truncated
+through its verified descriptor before computing this budget, so Resume/Retry
+can reuse its released space. Known Content-Length values above
+that budget are rejected before writing; unknown-length responses are counted
+before forwarding chunks. Free space is rechecked every 16 MiB to account for
+other disk activity, and copy headroom is checked again against the final byte
+count after the output stream closes, including short tails below that interval. These safety limits apply to TS archives only. Failure never promotes the partial to the
+library, and errors omit credential-bearing URLs.
+
+Completion means clean HTTP EOF, matching Content-Length when supplied, and
+valid nonempty TS packet framing. **It does not verify media duration or the
+provider's programme boundaries.** A provider can return a shorter valid clip
+with clean EOF; this version cannot identify that without demuxing duration.
+Unknown-length responses show indeterminate progress until EOF.
+
+Completed archive cards appear under All with programme title, channel and
+broadcast date. Clicking a card plays the local file through the download action;
+it does not navigate to a movie or series detail route. Files and metadata remain
+available after restart and after the source archive expires.
+
 ## Backend responsibilities
 
 - **Queue control (`apps/electron-backend/src/app/events/database/download-runtime.ts`)**
-  `DownloadTask` mirrors a row of the shared `downloads` table (type `Download` in `libs/shared/database/src/lib/schema.ts`) plus transient cancel/pause/progress helpers (shared task types live in `download-task.ts`). Request validation and row creation live in `download-requests.ts`, while `downloads.events.ts` stays focused on IPC registration. `enqueueDownload()` pushes the task onto `downloadQueue` and triggers `processQueue()`. `processQueue()` keeps one active download, updates the row to `downloading`, and calls `startDownload()`. The byte transfer itself lives in `download-transfer.ts`, finalization and retained-partial persistence in `download-finalize.ts`, and the renderer update broadcast in `download-broadcast.ts`.
+  `DownloadTask` mirrors a row of the shared `downloads` table (type `Download` in `libs/shared/database/src/lib/schema.ts`) plus transient cancel/pause/progress helpers (shared task types live in `download-task.ts`). Request validation and row creation live in `download-requests.ts`, retry/resume flows in `download-resume-requests.ts`, removal/terminal cleanup in
+  `download-removal-requests.ts`, while `downloads.events.ts` stays focused on IPC registration. `enqueueDownload()` pushes the task onto `downloadQueue` and triggers `processQueue()`. `processQueue()` keeps one active download, updates the row to `downloading`, and calls `startDownload()`. The byte transfer itself lives in `download-transfer.ts`, finalization and retained-partial persistence in `download-finalize.ts` (ordinary file promotion in `download-file-finalize.ts`, archive completion in
+  `download-catchup-completion.ts`, proven completion recovery in `download-catchup-recover-completion.ts`, target reservation in `download-runtime-reservation.ts`), cancellation/pause persistence in `download-runtime-persistence.ts`, and the renderer update broadcast in `download-broadcast.ts`.
 - **Range-aware transfer (`download-transfer.ts`)**
   The transfer streams the response through the backend's validated Axios redirect helper instead of `electron-dl`, and always requests `Accept-Encoding: identity`: Range offsets, totals, and the persisted `.part` must describe the same representation, and Axios's transparent gzip/brotli decoding would put decoded bytes on disk while every counter speaks encoded bytes. Headers (user agent, referer, origin) are persisted in `request_headers` and re-applied through the same allowlist when read back on retry/resume. Fresh Xtream movie and series-episode downloads propagate the playlist's configured headers, using its User-Agent when present and otherwise sharing the provider-compatible `XTREAM_CLIENT_USER_AGENT` used by Xtream API requests and stream probes. Retry, resume, and missing-file recovery resolve the owning playlist type and add that fallback to legacy Xtream rows without a stored User-Agent; known Stalker rows are left unchanged. Download rows deliberately outlive individually deleted playlists, so a headerless legacy row whose source no longer exists receives the same IPTV-player fallback because its original provider type cannot be recovered. Active pause/cancel operations abort the current request with `AbortController`; pause keeps the partial file and cancel removes it. Resume checks the existing `.part` size (rejecting anything that is not a regular file, so a symlink planted while paused is never followed). The first response's strong `ETag` (or `Last-Modified`) is persisted in `resume_validator`; a partial carrying that validator resumes with `Range: bytes=<offset>-` plus `If-Range`, so the server itself proves the entity is unchanged. A retained partial **without** a validator resumes through overlap verification instead (`download-overlap.ts`): the `Range` request rewinds by up to 256 KiB (`OVERLAP_VERIFICATION_BYTES`) and a transform stream compares that replayed window byte-for-byte against the partial's tail before anything is appended — a self-made validator for the many Xtream panels that send neither header. A mismatching overlap truncates the `.part` and restarts the transfer from byte zero (`OverlapMismatchError`); a partial smaller than the overlap window is verified in full from byte zero over a plain request and appended to — never rewritten in place, so a reconnect that dies early can only grow the file. Success requires the verifier to have consumed its ENTIRE window: a response that ends inside the overlap is an ordinary retained interruption when the stream died early, but a response that delivered its complete AUTHORITATIVE total inside the window — whether it then closed cleanly or reset — proves the remote entity shrank and restarts from scratch; the old suffix is never finalized as a completed file. An HTTP 416 answer to a resume request is classified by `classifyRangeNotSatisfiable()`: it COMPLETES only an exact-EOF request with identity proof (`If-Range`-backed, or the EOF probe that follows a fully verified overlap replay) whose stated `bytes */N` equals the partial — a bare length match on a rewound request proves nothing about whose bytes are on disk; it RESTARTS only when a STATED total proves the entity shrank — the total sits below a rewound request's first byte, or at it (the rewound range beginning exactly at the new EOF), or below the partial at an exact-EOF request; every length-less, ambiguous, or contradictory 416 RETAINS the partial, and none of these paths ever reaches generic cleanup. A validator promoted by a complete overlap match survives mid-append failures too: the promotion also runs on the error path, and retained-failure and pause persistence write `resume_validator` from the task, so later attempts resume via `If-Range` instead of replaying the window — without this, a server whose per-connection cap barely exceeds the window would stall out on sub-threshold progress. A verify-append attempt promotes the response's `ETag`/`Last-Modified` onto the row only after the complete overlap matched; until then the retained bytes are unproven and blessing them with a validator would let the next resume `If-Range`-append onto a foreign prefix. The response's TOTAL stays equally uncommitted (task and row) until the overlap matched — a persisted total equal to the unverified partial's size would let the completed-partial shortcut finalize unproven bytes after a pause, crash, or retained failure. Retained-interruption persistence keeps the live task in sync with the row (a stale falsified total would make the next reconnect's resume-offset guard reject the partial). Overlap replay re-counts bytes from the rewound offset, so reported progress is floored at the partial's retained size whenever the transfer appends — a response that ends inside the overlap can never move displayed progress backwards. A `206 Partial Content` answer must start at the requested offset (`Content-Range` is verified) before bytes are appended; any other 2xx answer — the server ignoring `Range`, or `If-Range` detecting that the remote file changed — restarts the transfer from byte zero over the same `.part` instead of failing the download.
 - **Destination collision policy**
@@ -294,12 +457,12 @@ display snapshot via `playlistDisplayLabel`).
 - **Lifecycle tracking** is owned by `EmbeddedMpvRecordingTracker`
   (`apps/electron-backend/src/app/services/embedded-mpv-recording-tracker.ts`):
   explicit start/stop hooks in `EmbeddedMpvNativeService` plus a
-  session-snapshot observer. The stop hook is a *request*, not an outcome —
+  session-snapshot observer. The stop hook is a _request_, not an outcome —
   `addon.stopRecording()` only dispatches (async mpv property set, or a
   command written to the frame-copy helper), so finalization always waits for
   the snapshot reporting the recording inactive; statting or unlinking
   earlier would report a short recording as failed and could delete bytes mpv
-  is still flushing. macOS native-view clears `recordingActive` *before*
+  is still flushing. macOS native-view clears `recordingActive` _before_
   dispatching the async property set and restores it if that request is
   rejected, so an inactive snapshot must additionally survive a 1.5 s settle
   window (three poll cycles) before it counts as an acknowledgement; a revived
@@ -355,7 +518,7 @@ display snapshot via `playlistDisplayLabel`).
   `RecordingStartMetadata` (channel name/logo, playlist id + display-label
   snapshot, source type, EPG key, current program) that flows
   `WebPlayerViewComponent → EmbeddedMpvPlayerComponent →
-  EmbeddedMpvControlsAdapter → EmbeddedMpvRecordingStartOptions.metadata`.
+EmbeddedMpvControlsAdapter → EmbeddedMpvRecordingStartOptions.metadata`.
   `EmbeddedMpvPlayerComponent` watches the session snapshot for the
   active→inactive recording edge and emits `recordingStopped` — one owner for
   every trigger, including a Stop clicked in the download manager, which
@@ -377,14 +540,14 @@ display snapshot via `playlistDisplayLabel`).
   target path — that is how a recording spanning a program boundary lists
   every covered show. The handler is deliberately independent of finalization: it
   looks the row up in **any** status (the newest for that path — `openSync
-  ('wx')` keeps a reserved path exclusive while its recording owns it) and
+('wx')` keeps a reserved path exclusive while its recording owns it) and
   `finalize()` never touches `programs_json`, so the two writes commit in
   either order. The only wait is the tracker's queue drain, which guarantees
   the row's INSERT exists — no deadline, and therefore no way for a one-shot
   enrichment to be dropped by a clock. A recording stopped while no player is mounted on that
   channel keeps its start snapshot.
 - **IPC surface** (`recordings.events.ts`): `RECORDINGS_GET_LIST/GET/STOP/
-  REMOVE/UPDATE_PROGRAMS/REVEAL_FILE/PLAY_FILE` plus the dedicated
+REMOVE/UPDATE_PROGRAMS/REVEAL_FILE/PLAY_FILE` plus the dedicated
   `RECORDINGS_UPDATE_EVENT` bare ping (not shared with downloads, so
   recording transitions do not force availability-probed download refetches).
   Active rows are decorated with a live `fs.stat` size — `file_size_bytes` is

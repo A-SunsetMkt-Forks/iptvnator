@@ -1,3 +1,8 @@
+import {
+    activateXtreamArchiveAction,
+    getProgramTimestampSeconds,
+} from './xtream-live-archive-actions';
+import { EpgArchiveDownloadService } from '@iptvnator/ui/epg';
 import { NgTemplateOutlet } from '@angular/common';
 import {
     ChangeDetectionStrategy,
@@ -152,6 +157,10 @@ export class LiveStreamLayoutComponent
             this.xtreamStore.currentPlaylist()?.serverUrl,
             this.selectedLiveItem()?.xtream_id,
         ])
+    );
+    private readonly archiveDownloads = inject(EpgArchiveDownloadService);
+    readonly archiveDownloadsAvailable = computed(
+        () => this.runtime.supportsDownloads && this.archivePlaybackAvailable()
     );
     private readonly archiveCopy = inject(EpgArchiveCopyService);
     private readonly xtreamUrlService = inject(XtreamUrlService);
@@ -619,28 +628,21 @@ export class LiveStreamLayoutComponent
             return;
         }
 
-        if (event.type === 'copy-catchup-url') {
-            const playlist = this.xtreamStore.currentPlaylist();
-            await this.archiveCopy.copy(() => {
-                const start = this.getProgramTimestampSeconds(
-                    event.program.start,
-                    event.program.startTimestamp
-                );
-                const stop = this.getProgramTimestampSeconds(
-                    event.program.stop,
-                    event.program.stopTimestamp
-                );
-                return playlist && start && stop && stop > start
-                    ? this.xtreamUrlService.resolveCatchupUrl(
-                          playlist.id,
-                          playlist,
-                          selectedItem.xtream_id,
-                          start,
-                          stop,
-                          playlist.serverTimezone
-                      )
-                    : null;
-            });
+        if (
+            event.type === 'download-catchup' ||
+            event.type === 'copy-catchup-url'
+        ) {
+            await activateXtreamArchiveAction(
+                event,
+                this.xtreamStore.currentPlaylist(),
+                selectedItem,
+                this.archiveDownloadsAvailable(),
+                {
+                    copy: this.archiveCopy,
+                    downloads: this.archiveDownloads,
+                    urls: this.xtreamUrlService,
+                }
+            );
             return;
         }
         if (event.type === 'live') {
@@ -795,11 +797,11 @@ export class LiveStreamLayoutComponent
             return;
         }
 
-        const startTimestamp = this.getProgramTimestampSeconds(
+        const startTimestamp = getProgramTimestampSeconds(
             program.start,
             program.startTimestamp
         );
-        const stopTimestamp = this.getProgramTimestampSeconds(
+        const stopTimestamp = getProgramTimestampSeconds(
             program.stop,
             program.stopTimestamp
         );
@@ -858,11 +860,11 @@ export class LiveStreamLayoutComponent
             title: program.title,
             desc: program.description ?? null,
             category: null,
-            startTimestamp: this.getProgramTimestampSeconds(
+            startTimestamp: getProgramTimestampSeconds(
                 program.start,
                 program.start_timestamp
             ),
-            stopTimestamp: this.getProgramTimestampSeconds(
+            stopTimestamp: getProgramTimestampSeconds(
                 program.stop ?? program.end,
                 program.stop_timestamp
             ),
@@ -900,29 +902,11 @@ export class LiveStreamLayoutComponent
         return this.runtime.supportsRemoteControl ? window.electron : undefined;
     }
 
-    private getProgramTimestampSeconds(
-        dateValue: string,
-        unixTimestampValue?: number | string | null
-    ): number | null {
-        const unixTimestamp = Number.parseInt(
-            String(unixTimestampValue ?? ''),
-            10
-        );
-        if (Number.isFinite(unixTimestamp) && unixTimestamp > 0) {
-            return unixTimestamp;
-        }
-
-        const parsedDate = Date.parse(dateValue);
-        return Number.isFinite(parsedDate)
-            ? Math.floor(parsedDate / 1000)
-            : null;
-    }
-
     private getProgramTimestampMilliseconds(
         dateValue: string,
         unixTimestampValue?: number | string | null
     ): number | null {
-        const unixTimestamp = this.getProgramTimestampSeconds(
+        const unixTimestamp = getProgramTimestampSeconds(
             dateValue,
             unixTimestampValue
         );
