@@ -65,6 +65,10 @@ const GUIDES = [
       'blog/guides/screenshots/guide-epg-offset-dark.png',
     ],
   },
+  {
+    slug: 'tmdb-metadata-guide',
+    screenshots: ['blog/guides/screenshots/guide-tmdb-settings-dark.png'],
+  },
 ];
 
 const readDist = (relativePath) => readFile(new URL(relativePath, distRoot), 'utf8');

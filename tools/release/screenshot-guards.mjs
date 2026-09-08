@@ -63,6 +63,7 @@ export const KNOWN_ACTIONS = [
     'load-demo-epg',
     'open-m3u-channel-menu',
     'open-epg-mapping-dialog',
+    'open-settings-tmdb',
 ];
 
 /**

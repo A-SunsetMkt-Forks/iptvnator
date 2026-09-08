@@ -195,6 +195,14 @@
             "setup": [
                 "open-settings-epg-offset"
             ]
+        },
+        {
+            "slug": "guide-tmdb-settings",
+            "title": "Settings: Metadata (TMDB)",
+            "group": "guides",
+            "setup": [
+                "open-settings-tmdb"
+            ]
         }
     ]
 }
